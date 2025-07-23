@@ -36,6 +36,7 @@ async function runClient(
   host: string,
   staticOAuthClientMetadata: StaticOAuthClientMetadata,
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
+  authEnvironment?: string,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -93,7 +94,7 @@ async function runClient(
 
   try {
     // Connect to remote server with lazy authentication
-    const transport = await connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const transport = await connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, authEnvironment)
 
     // Set up message and error handlers
     transport.onmessage = (message) => {
@@ -159,8 +160,8 @@ async function runClient(
 
 // Parse command-line arguments and run the client
 parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx client.ts <https://server-url> [callback-port] [--debug]')
-  .then(({ serverUrl, callbackPort, headers, transportStrategy, host, staticOAuthClientMetadata, staticOAuthClientInfo }) => {
-    return runClient(serverUrl, callbackPort, headers, transportStrategy, host, staticOAuthClientMetadata, staticOAuthClientInfo)
+  .then(({ serverUrl, callbackPort, headers, transportStrategy, host, staticOAuthClientMetadata, staticOAuthClientInfo, authEnvironment }) => {
+    return runClient(serverUrl, callbackPort, headers, transportStrategy, host, staticOAuthClientMetadata, staticOAuthClientInfo, authEnvironment)
   })
   .catch((error) => {
     console.error('Fatal error:', error)

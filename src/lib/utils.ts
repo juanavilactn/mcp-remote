@@ -14,6 +14,7 @@ import fs from 'fs'
 import { readFile, rm } from 'fs/promises'
 import path from 'path'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
+import { execSync } from 'child_process'
 
 // Global type declaration for typescript
 declare global {
@@ -31,6 +32,27 @@ export { MCP_REMOTE_VERSION }
 const pid = process.pid
 // Global debug flag
 export let DEBUG = false
+
+/**
+ * Gets an authorization token using masstackctl command
+ * @param environment The environment to use with masstackctl
+ * @returns The bearer token or null if failed
+ */
+export async function getMasstackToken(environment: string): Promise<string | null> {
+  try {
+    if (DEBUG) debugLog(`Getting token from masstackctl for environment: ${environment}`)
+
+    const command = `masstackctl -e ${environment} token`
+    const token = execSync(command, { encoding: 'utf8' }).trim()
+
+    if (DEBUG) debugLog(`Successfully obtained token from masstackctl`)
+    return token
+  } catch (error) {
+    log(`Error getting token from masstackctl: ${error}`)
+    if (DEBUG) debugLog('Error getting token from masstackctl', error)
+    return null
+  }
+}
 
 // Helper function for timestamp formatting
 function getTimestamp(): string {
@@ -180,6 +202,7 @@ export type AuthInitializer = () => Promise<{
  * @param headers Additional headers to send with the request
  * @param authInitializer Function to initialize authentication when needed
  * @param transportStrategy Strategy for selecting transport type ('sse-only', 'http-only', 'sse-first', 'http-first')
+ * @param authEnvironment Optional environment for masstackctl token authentication
  * @param recursionReasons Set of reasons for recursive calls (internal use)
  * @returns The connected transport
  */
@@ -190,10 +213,25 @@ export async function connectToRemoteServer(
   headers: Record<string, string>,
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
+  authEnvironment?: string,
   recursionReasons: Set<string> = new Set(),
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
   const url = new URL(serverUrl)
+
+  // If authEnvironment is provided, get token from masstackctl and add Authorization header
+  if (authEnvironment) {
+    const token = await getMasstackToken(authEnvironment)
+    if (token) {
+      headers = {
+        ...headers,
+        Authorization: `Bearer ${token}`,
+      }
+      if (DEBUG) debugLog(`Added Authorization header from masstackctl token`)
+    } else {
+      log(`Warning: Failed to obtain token from masstackctl for environment: ${authEnvironment}`)
+    }
+  }
 
   // Create transport with eventSourceInit to pass Authorization header if present
   const eventSourceInit = {
@@ -285,6 +323,7 @@ export async function connectToRemoteServer(
         headers,
         authInitializer,
         sseTransport ? 'http-only' : 'sse-only',
+        authEnvironment,
         recursionReasons,
       )
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
@@ -333,7 +372,7 @@ export async function connectToRemoteServer(
         if (DEBUG) debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, authEnvironment, recursionReasons)
       } catch (authError: any) {
         log('Authorization error:', authError)
         if (DEBUG)
@@ -617,6 +656,14 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log(`Using authorize resource: ${authorizeResource}`)
   }
 
+  // Parse auth-environment parameter
+  let authEnvironment: string | undefined
+  const authEnvIndex = args.indexOf('--auth-environment')
+  if (authEnvIndex !== -1 && authEnvIndex < args.length - 1) {
+    authEnvironment = args[authEnvIndex + 1]
+    log(`Using auth environment: ${authEnvironment}`)
+  }
+
   if (!serverUrl) {
     log(usage)
     process.exit(1)
@@ -691,6 +738,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     staticOAuthClientMetadata,
     staticOAuthClientInfo,
     authorizeResource,
+    authEnvironment,
   }
 }
 

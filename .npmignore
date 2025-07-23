@@ -1,0 +1,28 @@
+# Source files (only dist should be included)
+src/
+*.ts
+!*.d.ts
+
+# Development files
+.prettierignore
+tsconfig.json
+vitest.config.ts
+pnpm-lock.yaml
+
+# Test files
+**/*.spec.*
+
+# Development directories
+.git/
+.github/
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*

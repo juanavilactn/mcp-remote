@@ -36,6 +36,7 @@ async function runProxy(
   staticOAuthClientMetadata: StaticOAuthClientMetadata,
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authorizeResource: string,
+  authEnvironment?: string,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -86,7 +87,7 @@ async function runProxy(
 
   try {
     // Connect to remote server with lazy authentication
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy, authEnvironment)
 
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
@@ -155,6 +156,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       staticOAuthClientMetadata,
       staticOAuthClientInfo,
       authorizeResource,
+      authEnvironment,
     }) => {
       return runProxy(
         serverUrl,
@@ -165,6 +167,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         staticOAuthClientMetadata,
         staticOAuthClientInfo,
         authorizeResource,
+        authEnvironment,
       )
     },
   )
