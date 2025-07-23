@@ -218,7 +218,6 @@ export async function connectToRemoteServer(
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
   const url = new URL(serverUrl)
-
   // If authEnvironment is provided, get token from masstackctl and add Authorization header
   if (authEnvironment) {
     const token = await getMasstackToken(authEnvironment)
@@ -372,7 +371,16 @@ export async function connectToRemoteServer(
         if (DEBUG) debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, authEnvironment, recursionReasons)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          authEnvironment,
+          recursionReasons,
+        )
       } catch (authError: any) {
         log('Authorization error:', authError)
         if (DEBUG)

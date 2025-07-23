@@ -11,7 +11,7 @@ import {
   parseCommandLineArgs,
   setupSignalHandlers,
   version
-} from "./chunk-62ZKGFH4.js";
+} from "./chunk-CNSILOCG.js";
 
 // src/client.ts
 import { EventEmitter } from "events";

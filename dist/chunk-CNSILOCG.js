@@ -11081,7 +11081,7 @@ var ElicitResultSchema = ResultSchema.extend({
   /**
    * The user's response action.
    */
-  action: external_exports.enum(["accept", "reject", "cancel"]),
+  action: external_exports.enum(["accept", "decline", "cancel"]),
   /**
    * The collected user input content (only present if action is "accept").
    */
@@ -11241,6 +11241,7 @@ var Protocol = class {
     this._responseHandlers = /* @__PURE__ */ new Map();
     this._progressHandlers = /* @__PURE__ */ new Map();
     this._timeoutInfo = /* @__PURE__ */ new Map();
+    this._pendingDebouncedNotifications = /* @__PURE__ */ new Set();
     this.setNotificationHandler(CancelledNotificationSchema, (notification) => {
       const controller = this._requestHandlerAbortControllers.get(notification.params.requestId);
       controller === null || controller === void 0 ? void 0 : controller.abort(notification.params.reason);
@@ -11322,6 +11323,7 @@ var Protocol = class {
     const responseHandlers = this._responseHandlers;
     this._responseHandlers = /* @__PURE__ */ new Map();
     this._progressHandlers.clear();
+    this._pendingDebouncedNotifications.clear();
     this._transport = void 0;
     (_a = this.onclose) === null || _a === void 0 ? void 0 : _a.call(this);
     const error = new McpError(ErrorCode.ConnectionClosed, "Connection closed");
@@ -11521,10 +11523,32 @@ var Protocol = class {
    * Emits a notification, which is a one-way message that does not expect a response.
    */
   async notification(notification, options) {
+    var _a, _b;
     if (!this._transport) {
       throw new Error("Not connected");
     }
     this.assertNotificationCapability(notification.method);
+    const debouncedMethods = (_b = (_a = this._options) === null || _a === void 0 ? void 0 : _a.debouncedNotificationMethods) !== null && _b !== void 0 ? _b : [];
+    const canDebounce = debouncedMethods.includes(notification.method) && !notification.params && !(options === null || options === void 0 ? void 0 : options.relatedRequestId);
+    if (canDebounce) {
+      if (this._pendingDebouncedNotifications.has(notification.method)) {
+        return;
+      }
+      this._pendingDebouncedNotifications.add(notification.method);
+      Promise.resolve().then(() => {
+        var _a2;
+        this._pendingDebouncedNotifications.delete(notification.method);
+        if (!this._transport) {
+          return;
+        }
+        const jsonrpcNotification2 = {
+          ...notification,
+          jsonrpc: "2.0"
+        };
+        (_a2 = this._transport) === null || _a2 === void 0 ? void 0 : _a2.send(jsonrpcNotification2, options).catch((error) => this._onerror(error));
+      });
+      return;
+    }
     const jsonrpcNotification = {
       ...notification,
       jsonrpc: "2.0"
@@ -11825,7 +11849,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version = "0.1.18";
+var version = "1.0.0-rc1";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -11905,6 +11929,8 @@ var OAuthMetadataSchema = external_exports.object({
 }).passthrough();
 var OAuthTokensSchema = external_exports.object({
   access_token: external_exports.string(),
+  id_token: external_exports.string().optional(),
+  // Optional for OAuth 2.1, but necessary in OpenID Connect
   token_type: external_exports.string(),
   expires_in: external_exports.number().optional(),
   scope: external_exports.string().optional(),
@@ -12066,6 +12092,54 @@ var UnauthorizedError = class extends Error {
     super(message !== null && message !== void 0 ? message : "Unauthorized");
   }
 };
+function selectClientAuthMethod(clientInformation, supportedMethods) {
+  const hasClientSecret = clientInformation.client_secret !== void 0;
+  if (supportedMethods.length === 0) {
+    return hasClientSecret ? "client_secret_post" : "none";
+  }
+  if (hasClientSecret && supportedMethods.includes("client_secret_basic")) {
+    return "client_secret_basic";
+  }
+  if (hasClientSecret && supportedMethods.includes("client_secret_post")) {
+    return "client_secret_post";
+  }
+  if (supportedMethods.includes("none")) {
+    return "none";
+  }
+  return hasClientSecret ? "client_secret_post" : "none";
+}
+function applyClientAuthentication(method, clientInformation, headers, params) {
+  const { client_id, client_secret } = clientInformation;
+  switch (method) {
+    case "client_secret_basic":
+      applyBasicAuth(client_id, client_secret, headers);
+      return;
+    case "client_secret_post":
+      applyPostAuth(client_id, client_secret, params);
+      return;
+    case "none":
+      applyPublicAuth(client_id, params);
+      return;
+    default:
+      throw new Error(`Unsupported client authentication method: ${method}`);
+  }
+}
+function applyBasicAuth(clientId, clientSecret, headers) {
+  if (!clientSecret) {
+    throw new Error("client_secret_basic authentication requires a client_secret");
+  }
+  const credentials = btoa(`${clientId}:${clientSecret}`);
+  headers.set("Authorization", `Basic ${credentials}`);
+}
+function applyPostAuth(clientId, clientSecret, params) {
+  params.set("client_id", clientId);
+  if (clientSecret) {
+    params.set("client_secret", clientSecret);
+  }
+}
+function applyPublicAuth(clientId, params) {
+  params.set("client_id", clientId);
+}
 async function parseErrorResponse(input) {
   const statusCode = input instanceof Response ? input.status : void 0;
   const body = input instanceof Response ? await input.text() : input;
@@ -12094,18 +12168,20 @@ async function auth(provider, options) {
     throw error;
   }
 }
-async function authInternal(provider, { serverUrl, authorizationCode, scope, resourceMetadataUrl }) {
+async function authInternal(provider, { serverUrl, authorizationCode, scope, resourceMetadataUrl, fetchFn }) {
   let resourceMetadata;
   let authorizationServerUrl = serverUrl;
   try {
-    resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, { resourceMetadataUrl });
+    resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, { resourceMetadataUrl }, fetchFn);
     if (resourceMetadata.authorization_servers && resourceMetadata.authorization_servers.length > 0) {
       authorizationServerUrl = resourceMetadata.authorization_servers[0];
     }
   } catch (_a) {
   }
   const resource = await selectResourceURL(serverUrl, provider, resourceMetadata);
-  const metadata = await discoverOAuthMetadata(authorizationServerUrl);
+  const metadata = await discoverOAuthMetadata(serverUrl, {
+    authorizationServerUrl
+  }, fetchFn);
   let clientInformation = await Promise.resolve(provider.clientInformation());
   if (!clientInformation) {
     if (authorizationCode !== void 0) {
@@ -12129,7 +12205,9 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
       authorizationCode,
       codeVerifier: codeVerifier2,
       redirectUri: provider.redirectUrl,
-      resource
+      resource,
+      addClientAuthentication: provider.addClientAuthentication,
+      fetchFn
     });
     await provider.saveTokens(tokens2);
     return "AUTHORIZED";
@@ -12141,7 +12219,8 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
         metadata,
         clientInformation,
         refreshToken: tokens.refresh_token,
-        resource
+        resource,
+        addClientAuthentication: provider.addClientAuthentication
       });
       await provider.saveTokens(newTokens);
       return "AUTHORIZED";
@@ -12198,29 +12277,12 @@ function extractResourceMetadataUrl(res) {
     return void 0;
   }
 }
-async function discoverOAuthProtectedResourceMetadata(serverUrl, opts) {
-  var _a;
-  let url;
-  if (opts === null || opts === void 0 ? void 0 : opts.resourceMetadataUrl) {
-    url = new URL(opts === null || opts === void 0 ? void 0 : opts.resourceMetadataUrl);
-  } else {
-    url = new URL("/.well-known/oauth-protected-resource", serverUrl);
-  }
-  let response;
-  try {
-    response = await fetch(url, {
-      headers: {
-        "MCP-Protocol-Version": (_a = opts === null || opts === void 0 ? void 0 : opts.protocolVersion) !== null && _a !== void 0 ? _a : LATEST_PROTOCOL_VERSION
-      }
-    });
-  } catch (error) {
-    if (error instanceof TypeError) {
-      response = await fetch(url);
-    } else {
-      throw error;
-    }
-  }
-  if (response.status === 404) {
+async function discoverOAuthProtectedResourceMetadata(serverUrl, opts, fetchFn = fetch) {
+  const response = await discoverMetadataWithFallback(serverUrl, "oauth-protected-resource", fetchFn, {
+    protocolVersion: opts === null || opts === void 0 ? void 0 : opts.protocolVersion,
+    metadataUrl: opts === null || opts === void 0 ? void 0 : opts.resourceMetadataUrl
+  });
+  if (!response || response.status === 404) {
     throw new Error(`Resource server does not implement OAuth 2.0 Protected Resource Metadata.`);
   }
   if (!response.ok) {
@@ -12228,13 +12290,13 @@ async function discoverOAuthProtectedResourceMetadata(serverUrl, opts) {
   }
   return OAuthProtectedResourceMetadataSchema.parse(await response.json());
 }
-async function fetchWithCorsRetry(url, headers) {
+async function fetchWithCorsRetry(url, headers, fetchFn = fetch) {
   try {
-    return await fetch(url, { headers });
+    return await fetchFn(url, { headers });
   } catch (error) {
     if (error instanceof TypeError) {
       if (headers) {
-        return fetchWithCorsRetry(url);
+        return fetchWithCorsRetry(url, void 0, fetchFn);
       } else {
         return void 0;
       }
@@ -12242,33 +12304,56 @@ async function fetchWithCorsRetry(url, headers) {
     throw error;
   }
 }
-function buildWellKnownPath(pathname) {
-  let wellKnownPath = `/.well-known/oauth-authorization-server${pathname}`;
+function buildWellKnownPath(wellKnownPrefix, pathname) {
+  let wellKnownPath = `/.well-known/${wellKnownPrefix}${pathname}`;
   if (pathname.endsWith("/")) {
     wellKnownPath = wellKnownPath.slice(0, -1);
   }
   return wellKnownPath;
 }
-async function tryMetadataDiscovery(url, protocolVersion) {
+async function tryMetadataDiscovery(url, protocolVersion, fetchFn = fetch) {
   const headers = {
     "MCP-Protocol-Version": protocolVersion
   };
-  return await fetchWithCorsRetry(url, headers);
+  return await fetchWithCorsRetry(url, headers, fetchFn);
 }
 function shouldAttemptFallback(response, pathname) {
   return !response || response.status === 404 && pathname !== "/";
 }
-async function discoverOAuthMetadata(authorizationServerUrl, opts) {
-  var _a;
-  const issuer = new URL(authorizationServerUrl);
+async function discoverMetadataWithFallback(serverUrl, wellKnownType, fetchFn, opts) {
+  var _a, _b;
+  const issuer = new URL(serverUrl);
   const protocolVersion = (_a = opts === null || opts === void 0 ? void 0 : opts.protocolVersion) !== null && _a !== void 0 ? _a : LATEST_PROTOCOL_VERSION;
-  const wellKnownPath = buildWellKnownPath(issuer.pathname);
-  const pathAwareUrl = new URL(wellKnownPath, issuer);
-  let response = await tryMetadataDiscovery(pathAwareUrl, protocolVersion);
-  if (shouldAttemptFallback(response, issuer.pathname)) {
-    const rootUrl = new URL("/.well-known/oauth-authorization-server", issuer);
-    response = await tryMetadataDiscovery(rootUrl, protocolVersion);
+  let url;
+  if (opts === null || opts === void 0 ? void 0 : opts.metadataUrl) {
+    url = new URL(opts.metadataUrl);
+  } else {
+    const wellKnownPath = buildWellKnownPath(wellKnownType, issuer.pathname);
+    url = new URL(wellKnownPath, (_b = opts === null || opts === void 0 ? void 0 : opts.metadataServerUrl) !== null && _b !== void 0 ? _b : issuer);
+    url.search = issuer.search;
   }
+  let response = await tryMetadataDiscovery(url, protocolVersion, fetchFn);
+  if (!(opts === null || opts === void 0 ? void 0 : opts.metadataUrl) && shouldAttemptFallback(response, issuer.pathname)) {
+    const rootUrl = new URL(`/.well-known/${wellKnownType}`, issuer);
+    response = await tryMetadataDiscovery(rootUrl, protocolVersion, fetchFn);
+  }
+  return response;
+}
+async function discoverOAuthMetadata(issuer, { authorizationServerUrl, protocolVersion } = {}, fetchFn = fetch) {
+  if (typeof issuer === "string") {
+    issuer = new URL(issuer);
+  }
+  if (!authorizationServerUrl) {
+    authorizationServerUrl = issuer;
+  }
+  if (typeof authorizationServerUrl === "string") {
+    authorizationServerUrl = new URL(authorizationServerUrl);
+  }
+  protocolVersion !== null && protocolVersion !== void 0 ? protocolVersion : protocolVersion = LATEST_PROTOCOL_VERSION;
+  const response = await discoverMetadataWithFallback(authorizationServerUrl, "oauth-authorization-server", fetchFn, {
+    protocolVersion,
+    metadataServerUrl: authorizationServerUrl
+  });
   if (!response || response.status === 404) {
     return void 0;
   }
@@ -12306,40 +12391,43 @@ async function startAuthorization(authorizationServerUrl, { metadata, clientInfo
   if (scope) {
     authorizationUrl.searchParams.set("scope", scope);
   }
+  if (scope === null || scope === void 0 ? void 0 : scope.includes("offline_access")) {
+    authorizationUrl.searchParams.append("prompt", "consent");
+  }
   if (resource) {
     authorizationUrl.searchParams.set("resource", resource.href);
   }
   return { authorizationUrl, codeVerifier };
 }
-async function exchangeAuthorization(authorizationServerUrl, { metadata, clientInformation, authorizationCode, codeVerifier, redirectUri, resource }) {
+async function exchangeAuthorization(authorizationServerUrl, { metadata, clientInformation, authorizationCode, codeVerifier, redirectUri, resource, addClientAuthentication, fetchFn }) {
+  var _a;
   const grantType = "authorization_code";
-  let tokenUrl;
-  if (metadata) {
-    tokenUrl = new URL(metadata.token_endpoint);
-    if (metadata.grant_types_supported && !metadata.grant_types_supported.includes(grantType)) {
-      throw new Error(`Incompatible auth server: does not support grant type ${grantType}`);
-    }
-  } else {
-    tokenUrl = new URL("/token", authorizationServerUrl);
+  const tokenUrl = (metadata === null || metadata === void 0 ? void 0 : metadata.token_endpoint) ? new URL(metadata.token_endpoint) : new URL("/token", authorizationServerUrl);
+  if ((metadata === null || metadata === void 0 ? void 0 : metadata.grant_types_supported) && !metadata.grant_types_supported.includes(grantType)) {
+    throw new Error(`Incompatible auth server: does not support grant type ${grantType}`);
   }
+  const headers = new Headers({
+    "Content-Type": "application/x-www-form-urlencoded"
+  });
   const params = new URLSearchParams({
     grant_type: grantType,
-    client_id: clientInformation.client_id,
     code: authorizationCode,
     code_verifier: codeVerifier,
     redirect_uri: String(redirectUri)
   });
-  if (clientInformation.client_secret) {
-    params.set("client_secret", clientInformation.client_secret);
+  if (addClientAuthentication) {
+    addClientAuthentication(headers, params, authorizationServerUrl, metadata);
+  } else {
+    const supportedMethods = (_a = metadata === null || metadata === void 0 ? void 0 : metadata.token_endpoint_auth_methods_supported) !== null && _a !== void 0 ? _a : [];
+    const authMethod = selectClientAuthMethod(clientInformation, supportedMethods);
+    applyClientAuthentication(authMethod, clientInformation, headers, params);
   }
   if (resource) {
     params.set("resource", resource.href);
   }
-  const response = await fetch(tokenUrl, {
+  const response = await (fetchFn !== null && fetchFn !== void 0 ? fetchFn : fetch)(tokenUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
+    headers,
     body: params
   });
   if (!response.ok) {
@@ -12347,7 +12435,8 @@ async function exchangeAuthorization(authorizationServerUrl, { metadata, clientI
   }
   return OAuthTokensSchema.parse(await response.json());
 }
-async function refreshAuthorization(authorizationServerUrl, { metadata, clientInformation, refreshToken, resource }) {
+async function refreshAuthorization(authorizationServerUrl, { metadata, clientInformation, refreshToken, resource, addClientAuthentication, fetchFn }) {
+  var _a;
   const grantType = "refresh_token";
   let tokenUrl;
   if (metadata) {
@@ -12358,22 +12447,26 @@ async function refreshAuthorization(authorizationServerUrl, { metadata, clientIn
   } else {
     tokenUrl = new URL("/token", authorizationServerUrl);
   }
+  const headers = new Headers({
+    "Content-Type": "application/x-www-form-urlencoded"
+  });
   const params = new URLSearchParams({
     grant_type: grantType,
-    client_id: clientInformation.client_id,
     refresh_token: refreshToken
   });
-  if (clientInformation.client_secret) {
-    params.set("client_secret", clientInformation.client_secret);
+  if (addClientAuthentication) {
+    addClientAuthentication(headers, params, authorizationServerUrl, metadata);
+  } else {
+    const supportedMethods = (_a = metadata === null || metadata === void 0 ? void 0 : metadata.token_endpoint_auth_methods_supported) !== null && _a !== void 0 ? _a : [];
+    const authMethod = selectClientAuthMethod(clientInformation, supportedMethods);
+    applyClientAuthentication(authMethod, clientInformation, headers, params);
   }
   if (resource) {
     params.set("resource", resource.href);
   }
-  const response = await fetch(tokenUrl, {
+  const response = await (fetchFn !== null && fetchFn !== void 0 ? fetchFn : fetch)(tokenUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
+    headers,
     body: params
   });
   if (!response.ok) {
@@ -12381,7 +12474,7 @@ async function refreshAuthorization(authorizationServerUrl, { metadata, clientIn
   }
   return OAuthTokensSchema.parse({ refresh_token: refreshToken, ...await response.json() });
 }
-async function registerClient(authorizationServerUrl, { metadata, clientMetadata }) {
+async function registerClient(authorizationServerUrl, { metadata, clientMetadata, fetchFn }) {
   let registrationUrl;
   if (metadata) {
     if (!metadata.registration_endpoint) {
@@ -12391,7 +12484,7 @@ async function registerClient(authorizationServerUrl, { metadata, clientMetadata
   } else {
     registrationUrl = new URL("/register", authorizationServerUrl);
   }
-  const response = await fetch(registrationUrl, {
+  const response = await (fetchFn !== null && fetchFn !== void 0 ? fetchFn : fetch)(registrationUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
@@ -12819,6 +12912,7 @@ var SSEClientTransport = class {
     this._eventSourceInit = opts === null || opts === void 0 ? void 0 : opts.eventSourceInit;
     this._requestInit = opts === null || opts === void 0 ? void 0 : opts.requestInit;
     this._authProvider = opts === null || opts === void 0 ? void 0 : opts.authProvider;
+    this._fetch = opts === null || opts === void 0 ? void 0 : opts.fetch;
   }
   async _authThenStart() {
     var _a;
@@ -12827,7 +12921,7 @@ var SSEClientTransport = class {
     }
     let result;
     try {
-      result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl });
+      result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl, fetchFn: this._fetch });
     } catch (error) {
       (_a = this.onerror) === null || _a === void 0 ? void 0 : _a.call(this, error);
       throw error;
@@ -12839,9 +12933,7 @@ var SSEClientTransport = class {
   }
   async _commonHeaders() {
     var _a;
-    const headers = {
-      ...(_a = this._requestInit) === null || _a === void 0 ? void 0 : _a.headers
-    };
+    const headers = {};
     if (this._authProvider) {
       const tokens = await this._authProvider.tokens();
       if (tokens) {
@@ -12851,22 +12943,20 @@ var SSEClientTransport = class {
     if (this._protocolVersion) {
       headers["mcp-protocol-version"] = this._protocolVersion;
     }
-    return headers;
+    return new Headers({ ...headers, ...(_a = this._requestInit) === null || _a === void 0 ? void 0 : _a.headers });
   }
   _startOrAuth() {
-    var _a;
-    const fetchImpl = ((_a = this === null || this === void 0 ? void 0 : this._eventSourceInit) === null || _a === void 0 ? void 0 : _a.fetch) || fetch;
+    var _a, _b, _c;
+    const fetchImpl = (_c = (_b = (_a = this === null || this === void 0 ? void 0 : this._eventSourceInit) === null || _a === void 0 ? void 0 : _a.fetch) !== null && _b !== void 0 ? _b : this._fetch) !== null && _c !== void 0 ? _c : fetch;
     return new Promise((resolve, reject) => {
       this._eventSource = new EventSource(this._url.href, {
         ...this._eventSourceInit,
         fetch: async (url, init) => {
           const headers = await this._commonHeaders();
+          headers.set("Accept", "text/event-stream");
           const response = await fetchImpl(url, {
             ...init,
-            headers: new Headers({
-              ...headers,
-              Accept: "text/event-stream"
-            })
+            headers
           });
           if (response.status === 401 && response.headers.has("www-authenticate")) {
             this._resourceMetadataUrl = extractResourceMetadataUrl(response);
@@ -12904,7 +12994,7 @@ var SSEClientTransport = class {
         resolve();
       });
       this._eventSource.onmessage = (event) => {
-        var _a2, _b;
+        var _a2, _b2;
         const messageEvent = event;
         let message;
         try {
@@ -12913,7 +13003,7 @@ var SSEClientTransport = class {
           (_a2 = this.onerror) === null || _a2 === void 0 ? void 0 : _a2.call(this, error);
           return;
         }
-        (_b = this.onmessage) === null || _b === void 0 ? void 0 : _b.call(this, message);
+        (_b2 = this.onmessage) === null || _b2 === void 0 ? void 0 : _b2.call(this, message);
       };
     });
   }
@@ -12930,7 +13020,7 @@ var SSEClientTransport = class {
     if (!this._authProvider) {
       throw new UnauthorizedError("No auth provider");
     }
-    const result = await auth(this._authProvider, { serverUrl: this._url, authorizationCode, resourceMetadataUrl: this._resourceMetadataUrl });
+    const result = await auth(this._authProvider, { serverUrl: this._url, authorizationCode, resourceMetadataUrl: this._resourceMetadataUrl, fetchFn: this._fetch });
     if (result !== "AUTHORIZED") {
       throw new UnauthorizedError("Failed to authorize");
     }
@@ -12942,13 +13032,12 @@ var SSEClientTransport = class {
     (_c = this.onclose) === null || _c === void 0 ? void 0 : _c.call(this);
   }
   async send(message) {
-    var _a, _b;
+    var _a, _b, _c;
     if (!this._endpoint) {
       throw new Error("Not connected");
     }
     try {
-      const commonHeaders = await this._commonHeaders();
-      const headers = new Headers(commonHeaders);
+      const headers = await this._commonHeaders();
       headers.set("content-type", "application/json");
       const init = {
         ...this._requestInit,
@@ -12957,11 +13046,11 @@ var SSEClientTransport = class {
         body: JSON.stringify(message),
         signal: (_a = this._abortController) === null || _a === void 0 ? void 0 : _a.signal
       };
-      const response = await fetch(this._endpoint, init);
+      const response = await ((_b = this._fetch) !== null && _b !== void 0 ? _b : fetch)(this._endpoint, init);
       if (!response.ok) {
         if (response.status === 401 && this._authProvider) {
           this._resourceMetadataUrl = extractResourceMetadataUrl(response);
-          const result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl });
+          const result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl, fetchFn: this._fetch });
           if (result !== "AUTHORIZED") {
             throw new UnauthorizedError();
           }
@@ -12971,7 +13060,7 @@ var SSEClientTransport = class {
         throw new Error(`Error POSTing to endpoint (HTTP ${response.status}): ${text}`);
       }
     } catch (error) {
-      (_b = this.onerror) === null || _b === void 0 ? void 0 : _b.call(this, error);
+      (_c = this.onerror) === null || _c === void 0 ? void 0 : _c.call(this, error);
       throw error;
     }
   }
@@ -13024,6 +13113,7 @@ var StreamableHTTPClientTransport = class {
     this._resourceMetadataUrl = void 0;
     this._requestInit = opts === null || opts === void 0 ? void 0 : opts.requestInit;
     this._authProvider = opts === null || opts === void 0 ? void 0 : opts.authProvider;
+    this._fetch = opts === null || opts === void 0 ? void 0 : opts.fetch;
     this._sessionId = opts === null || opts === void 0 ? void 0 : opts.sessionId;
     this._reconnectionOptions = (_a = opts === null || opts === void 0 ? void 0 : opts.reconnectionOptions) !== null && _a !== void 0 ? _a : DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS;
   }
@@ -13034,7 +13124,7 @@ var StreamableHTTPClientTransport = class {
     }
     let result;
     try {
-      result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl });
+      result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl, fetchFn: this._fetch });
     } catch (error) {
       (_a = this.onerror) === null || _a === void 0 ? void 0 : _a.call(this, error);
       throw error;
@@ -13066,7 +13156,7 @@ var StreamableHTTPClientTransport = class {
     });
   }
   async _startOrAuthSse(options) {
-    var _a, _b;
+    var _a, _b, _c;
     const { resumptionToken } = options;
     try {
       const headers = await this._commonHeaders();
@@ -13074,10 +13164,10 @@ var StreamableHTTPClientTransport = class {
       if (resumptionToken) {
         headers.set("last-event-id", resumptionToken);
       }
-      const response = await fetch(this._url, {
+      const response = await ((_a = this._fetch) !== null && _a !== void 0 ? _a : fetch)(this._url, {
         method: "GET",
         headers,
-        signal: (_a = this._abortController) === null || _a === void 0 ? void 0 : _a.signal
+        signal: (_b = this._abortController) === null || _b === void 0 ? void 0 : _b.signal
       });
       if (!response.ok) {
         if (response.status === 401 && this._authProvider) {
@@ -13088,9 +13178,9 @@ var StreamableHTTPClientTransport = class {
         }
         throw new StreamableHTTPError(response.status, `Failed to open SSE stream: ${response.statusText}`);
       }
-      this._handleSseStream(response.body, options);
+      this._handleSseStream(response.body, options, true);
     } catch (error) {
-      (_b = this.onerror) === null || _b === void 0 ? void 0 : _b.call(this, error);
+      (_c = this.onerror) === null || _c === void 0 ? void 0 : _c.call(this, error);
       throw error;
     }
   }
@@ -13139,7 +13229,7 @@ var StreamableHTTPClientTransport = class {
       });
     }, delay);
   }
-  _handleSseStream(stream, options) {
+  _handleSseStream(stream, options, isReconnectable) {
     if (!stream) {
       return;
     }
@@ -13172,17 +13262,15 @@ var StreamableHTTPClientTransport = class {
         }
       } catch (error) {
         (_c = this.onerror) === null || _c === void 0 ? void 0 : _c.call(this, new Error(`SSE stream disconnected: ${error}`));
-        if (this._abortController && !this._abortController.signal.aborted) {
-          if (lastEventId !== void 0) {
-            try {
-              this._scheduleReconnection({
-                resumptionToken: lastEventId,
-                onresumptiontoken,
-                replayMessageId
-              }, 0);
-            } catch (error2) {
-              (_d = this.onerror) === null || _d === void 0 ? void 0 : _d.call(this, new Error(`Failed to reconnect: ${error2 instanceof Error ? error2.message : String(error2)}`));
-            }
+        if (isReconnectable && this._abortController && !this._abortController.signal.aborted) {
+          try {
+            this._scheduleReconnection({
+              resumptionToken: lastEventId,
+              onresumptiontoken,
+              replayMessageId
+            }, 0);
+          } catch (error2) {
+            (_d = this.onerror) === null || _d === void 0 ? void 0 : _d.call(this, new Error(`Failed to reconnect: ${error2 instanceof Error ? error2.message : String(error2)}`));
           }
         }
       }
@@ -13202,7 +13290,7 @@ var StreamableHTTPClientTransport = class {
     if (!this._authProvider) {
       throw new UnauthorizedError("No auth provider");
     }
-    const result = await auth(this._authProvider, { serverUrl: this._url, authorizationCode, resourceMetadataUrl: this._resourceMetadataUrl });
+    const result = await auth(this._authProvider, { serverUrl: this._url, authorizationCode, resourceMetadataUrl: this._resourceMetadataUrl, fetchFn: this._fetch });
     if (result !== "AUTHORIZED") {
       throw new UnauthorizedError("Failed to authorize");
     }
@@ -13213,7 +13301,7 @@ var StreamableHTTPClientTransport = class {
     (_b = this.onclose) === null || _b === void 0 ? void 0 : _b.call(this);
   }
   async send(message, options) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     try {
       const { resumptionToken, onresumptiontoken } = options || {};
       if (resumptionToken) {
@@ -13233,7 +13321,7 @@ var StreamableHTTPClientTransport = class {
         body: JSON.stringify(message),
         signal: (_a = this._abortController) === null || _a === void 0 ? void 0 : _a.signal
       };
-      const response = await fetch(this._url, init);
+      const response = await ((_b = this._fetch) !== null && _b !== void 0 ? _b : fetch)(this._url, init);
       const sessionId = response.headers.get("mcp-session-id");
       if (sessionId) {
         this._sessionId = sessionId;
@@ -13241,7 +13329,7 @@ var StreamableHTTPClientTransport = class {
       if (!response.ok) {
         if (response.status === 401 && this._authProvider) {
           this._resourceMetadataUrl = extractResourceMetadataUrl(response);
-          const result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl });
+          const result = await auth(this._authProvider, { serverUrl: this._url, resourceMetadataUrl: this._resourceMetadataUrl, fetchFn: this._fetch });
           if (result !== "AUTHORIZED") {
             throw new UnauthorizedError();
           }
@@ -13264,19 +13352,19 @@ var StreamableHTTPClientTransport = class {
       const contentType = response.headers.get("content-type");
       if (hasRequests) {
         if (contentType === null || contentType === void 0 ? void 0 : contentType.includes("text/event-stream")) {
-          this._handleSseStream(response.body, { onresumptiontoken });
+          this._handleSseStream(response.body, { onresumptiontoken }, false);
         } else if (contentType === null || contentType === void 0 ? void 0 : contentType.includes("application/json")) {
           const data = await response.json();
           const responseMessages = Array.isArray(data) ? data.map((msg) => JSONRPCMessageSchema.parse(msg)) : [JSONRPCMessageSchema.parse(data)];
           for (const msg of responseMessages) {
-            (_b = this.onmessage) === null || _b === void 0 ? void 0 : _b.call(this, msg);
+            (_c = this.onmessage) === null || _c === void 0 ? void 0 : _c.call(this, msg);
           }
         } else {
           throw new StreamableHTTPError(-1, `Unexpected content type: ${contentType}`);
         }
       }
     } catch (error) {
-      (_c = this.onerror) === null || _c === void 0 ? void 0 : _c.call(this, error);
+      (_d = this.onerror) === null || _d === void 0 ? void 0 : _d.call(this, error);
       throw error;
     }
   }
@@ -13295,7 +13383,7 @@ var StreamableHTTPClientTransport = class {
    * the server does not allow clients to terminate sessions.
    */
   async terminateSession() {
-    var _a, _b;
+    var _a, _b, _c;
     if (!this._sessionId) {
       return;
     }
@@ -13307,13 +13395,13 @@ var StreamableHTTPClientTransport = class {
         headers,
         signal: (_a = this._abortController) === null || _a === void 0 ? void 0 : _a.signal
       };
-      const response = await fetch(this._url, init);
+      const response = await ((_b = this._fetch) !== null && _b !== void 0 ? _b : fetch)(this._url, init);
       if (!response.ok && response.status !== 405) {
         throw new StreamableHTTPError(response.status, `Failed to terminate session: ${response.statusText}`);
       }
       this._sessionId = void 0;
     } catch (error) {
-      (_b = this.onerror) === null || _b === void 0 ? void 0 : _b.call(this, error);
+      (_c = this.onerror) === null || _c === void 0 ? void 0 : _c.call(this, error);
       throw error;
     }
   }
@@ -13659,7 +13747,16 @@ async function connectToRemoteServer(client, serverUrl, authProvider, headers, a
         recursionReasons.add(REASON_AUTH_NEEDED);
         log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`);
         if (DEBUG) debugLog("Recursively reconnecting after auth", { recursionReasons: Array.from(recursionReasons) });
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, authEnvironment, recursionReasons);
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          authEnvironment,
+          recursionReasons
+        );
       } catch (authError) {
         log("Authorization error:", authError);
         if (DEBUG)
